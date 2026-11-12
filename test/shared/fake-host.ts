@@ -1,0 +1,253 @@
+import { encode } from '@msgpack/msgpack';
+
+import { PROTOCOL_VERSION } from '../../contracts/protocol.js';
+import type { AssetUploadPolicy, ObjectContext, PeerRole, ServerMessage } from '../../contracts/protocol.js';
+import { ACCESS_TOKEN_SECONDS, signToken } from '../../src/core/auth/tokens.js';
+import { BanList } from '../../src/core/moderation/bans.js';
+import { decodeFrame } from '../../src/core/rooms/codec.js';
+import { RoomEngine } from '../../src/core/rooms/engine.js';
+import type { RoleBook, RoomEvent, RoomFacts, RoomHost, RoomStore, Seat } from '../../src/core/rooms/host.js';
+import { ObjectIndex } from '../../src/core/rooms/object-index.js';
+import type { StoredEntry } from '../../src/core/rooms/object-index.js';
+import { describe } from '../../src/core/rooms/visibility.js';
+
+// A room in memory only, for running RoomEngine without a room server. Used to check, for either
+// room server, what is hard to bring about from the room server (such as what arrives while the room
+// is being deleted).
+
+export const SECRET = 'fake-host-secret-0123456789abcdefgh';
+
+/** A room's objects, kept in memory. */
+export class MemoryStore extends ObjectIndex implements RoomStore {
+  readonly rows = new Map<string, { entry: StoredEntry; data: unknown }>();
+  readonly marks = new Set<string>();
+
+  protected loadEntries(): [string, StoredEntry][] {
+    return Array.from(this.rows, ([identifier, row]) => [identifier, row.entry]);
+  }
+
+  protected loadTombstones(): Iterable<string> {
+    return this.marks;
+  }
+
+  protected readData(identifier: string): unknown {
+    return this.rows.get(identifier)?.data;
+  }
+
+  flush(): number {
+    const count = this.pending.size;
+    for (const [identifier, write] of this.pending) {
+      if (write.context === null) this.rows.delete(identifier);
+      else if (write.context) this.rows.set(identifier, rowOf(write.context, write.owner ?? null));
+      if (write.tombstone === true) this.marks.add(identifier);
+      if (write.tombstone === false) this.marks.delete(identifier);
+    }
+    this.pending.clear();
+    return count;
+  }
+
+  /** Acts as if the write failed, and sets the index back to what is stored. */
+  goBack(identifier: string): void {
+    this.resync(identifier, this.rows.get(identifier)?.entry ?? null, this.marks.has(identifier));
+  }
+}
+
+const rowOf = (context: ObjectContext, owner: string | null) => ({
+  entry: {
+    alias: context.aliasName,
+    majorVersion: context.majorVersion,
+    minorVersion: context.minorVersion,
+    owner,
+    ...describe(context),
+  },
+  data: context.syncData,
+});
+
+/** Someone connected to the room in memory. */
+export class FakeConn {
+  seat: Seat | null = null;
+  readonly received: ServerMessage[] = [];
+  closed: { code: number; reason: string } | null = null;
+
+  /** The messages received that are of that type. */
+  of<T extends ServerMessage['type']>(type: T): Extract<ServerMessage, { type: T }>[] {
+    return this.received.filter((message): message is Extract<ServerMessage, { type: T }> => message.type === type);
+  }
+}
+
+export class FakeHost implements RoomHost<FakeConn> {
+  readonly conns: FakeConn[] = [];
+  facts: RoomFacts | null = { roomKey: 'room', password: null };
+  deleting = false;
+  readonly objects = new MemoryStore();
+  readonly roleMap = new Map<string, PeerRole>();
+  readonly events: [RoomEvent, string, number][] = [];
+  /** The notices that people are in, that everyone is gone, and that the list is to be updated. */
+  readonly notices: string[] = [];
+  /** When the next check was moved to, each time it was moved. */
+  readonly rechecks: number[] = [];
+  readonly deferred: Promise<unknown>[] = [];
+  /**
+   * How assets are stored, as told in welcome. Set as for a room server with a limit on the body, like
+   * the Vercel version.
+   */
+  policy: AssetUploadPolicy | null = { maxPutBytes: 4_000_000, directUpload: true };
+  /**
+   * The operator's bans. At hand by default, so that a hello is let in at once; a test makes it a
+   * promise to have the hello wait, as on a room server.
+   */
+  bansOf: () => BanList | Promise<BanList> = () => new BanList([]);
+  /** When the room list has been told of the changes. */
+  listedOf: () => Promise<void> = () => Promise.resolve();
+  readonly engine = new RoomEngine<FakeConn>(this);
+
+  connections(): FakeConn[] {
+    return this.conns;
+  }
+
+  seatOf(conn: FakeConn): Seat | null {
+    return conn.seat;
+  }
+
+  setSeat(conn: FakeConn, seat: Seat): void {
+    conn.seat = seat;
+  }
+
+  /** The address each connection came from, when it was told one. */
+  private readonly addresses = new WeakMap<FakeConn, string>();
+
+  addressOf(conn: FakeConn): string | undefined {
+    return this.addresses.get(conn);
+  }
+
+  /** When each connection's last ping was answered without the room, as a test sets it. */
+  readonly pings = new WeakMap<FakeConn, number>();
+
+  pingedAt(conn: FakeConn): number | null {
+    return this.pings.get(conn) ?? null;
+  }
+
+  send(conn: FakeConn, frame: Uint8Array): void {
+    conn.received.push(decodeFrame(frame) as ServerMessage);
+  }
+
+  close(conn: FakeConn, code: number, reason: string): void {
+    conn.closed = { code, reason };
+  }
+
+  room(): RoomFacts | null {
+    return this.facts;
+  }
+
+  wiping(): boolean {
+    return this.deleting;
+  }
+
+  store(): MemoryStore {
+    return this.objects;
+  }
+
+  readonly roles: RoleBook = {
+    roleOf: (userId) => this.roleMap.get(userId) ?? null,
+    add: (userId, role) => void this.roleMap.set(userId, role),
+    set: (userId, role) => {
+      this.roleMap.set(userId, role);
+      this.watchers.delete(userId);
+    },
+    gameMasterCount: () => [...this.roleMap.values()].filter((role) => role === 'gm').length,
+    isWatching: (userId) => this.watchers.has(userId),
+    setWatching: (userId, watching) => void (watching ? this.watchers.add(userId) : this.watchers.delete(userId)),
+  };
+  /** Those watching as a guest. */
+  readonly watchers = new Set<string>();
+
+  sessionSecret(): string | null {
+    return SECRET;
+  }
+
+  assetUploadPolicy(): AssetUploadPolicy | null {
+    return this.policy;
+  }
+
+  occupied(): void {
+    this.notices.push('occupied');
+  }
+
+  recheckAt(at: number): void {
+    this.rechecks.push(at);
+  }
+
+  emptied(): void {
+    this.notices.push('emptied');
+  }
+
+  lobbyChanged(): void {
+    this.notices.push('lobby');
+  }
+
+  listed(): Promise<void> {
+    return this.listedOf();
+  }
+
+  bans(): BanList | Promise<BanList> {
+    return this.bansOf();
+  }
+
+  record(event: RoomEvent, detail: string, value: number): void {
+    this.events.push([event, detail, value]);
+  }
+
+  defer(work: Promise<unknown>): void {
+    this.deferred.push(work);
+  }
+
+  /** Connects, and has the room take the connection. address is the sender's IP address. */
+  connect(address?: string): FakeConn {
+    const conn = new FakeConn();
+    this.conns.push(conn);
+    if (address !== undefined) this.addresses.set(conn, address);
+    this.engine.accept(conn);
+    return conn;
+  }
+
+  /** Connects, and comes in as `user-<peerId>`, logged in. */
+  join(peerId: string, role: PeerRole = 'pl'): FakeConn {
+    const conn = this.connect();
+    this.hello(conn, peerId, role);
+    return conn;
+  }
+
+  /** Hands over a fresh access token for `user-<peerId>`, as a page does before the old one runs out. */
+  renew(conn: FakeConn, peerId: string): void {
+    this.engine.receive(conn, encode({ type: 'auth', accessToken: tokenOf(peerId) }));
+  }
+
+  /** Sends hello as `user-<peerId>`, logged in. */
+  hello(conn: FakeConn, peerId: string, role: PeerRole = 'pl'): void {
+    const userId = `user-${peerId}`;
+    this.roleMap.set(userId, role);
+    this.engine.receive(
+      conn,
+      encode({
+        type: 'hello',
+        protocolVersion: PROTOCOL_VERSION,
+        peerId,
+        userId,
+        accessToken: tokenOf(peerId),
+      })
+    );
+  }
+
+  /** Sends events to the room. */
+  emit(conn: FakeConn, events: { eventName: string; data: unknown }[], to?: string): void {
+    this.engine.receive(conn, encode({ type: 'send', ...(to === undefined ? {} : { to }), events }));
+  }
+}
+
+/** An access token for `user-<peerId>`, good for ACCESS_TOKEN_SECONDS from now. */
+const tokenOf = (peerId: string) =>
+  signToken<'access'>(
+    { aud: 'access', sub: `discord:${peerId}`, uid: `user-${peerId}`, name: peerId },
+    ACCESS_TOKEN_SECONDS,
+    SECRET
+  );
